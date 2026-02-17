@@ -4,3 +4,6 @@ __pycache__/
 *.iml
 .ipynb_checkpoints/
 *.pyc
+
+images/
+matches_visualization/
