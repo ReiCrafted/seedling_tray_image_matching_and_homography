@@ -43,12 +43,31 @@ def find_image_pairs(directory):
             
     return pairs
 
+
+def build_affine(tx, ty, angle_deg, cx=0.0, cy=0.0):
+    """
+    Builds a 2x3 affine matrix from translation + rotation around a center point.
+    The transformation order is: translate center to origin → rotate → translate back + apply user offset.
+    """
+    angle_rad = np.radians(angle_deg)
+    cos_a = np.cos(angle_rad)
+    sin_a = np.sin(angle_rad)
+    
+    # Rotation around (cx, cy) plus translation (tx, ty)
+    M = np.array([
+        [cos_a, -sin_a, -cx * cos_a + cy * sin_a + cx + tx],
+        [sin_a,  cos_a, -cx * sin_a - cy * cos_a + cy + ty]
+    ], dtype=np.float64)
+    return M
+
+
 class ManualAlignmentUI:
     def __init__(self, pairs, start_idx=0):
         self.pairs = pairs
         self.current_idx = start_idx
-        self.saved_matrices = {} # Stores custom matrices
-        self.homography_status = {} # Tracks whether initial homography succeeded or failed
+        self.saved_matrices = {}  # Stores affine matrices (2x3)
+        self.saved_params = {}    # Stores (tx, ty, angle) tuples
+        self.match_status = {}    # Tracks whether initial auto-match succeeded
         
         if len(self.pairs) == 0:
             raise ValueError("No image pairs provided.")
@@ -61,29 +80,35 @@ class ManualAlignmentUI:
         cv.resizeWindow(self.window_name, self.canvas_w, self.canvas_h)
         cv.setMouseCallback(self.window_name, self.mouse_callback)
         
-        self.dragging_idx = -1
-        self.panning = False
+        # Interaction state
+        self.dragging = False       # Left-click drag = translate
+        self.rotating = False       # Right-click drag = rotate
+        self.panning = False        # Middle-click or Ctrl+Left = pan viewport
         self.mode = 0  # 0: Alpha, 1: Difference, 2: Anaglyph, 3: Edges
         self.modes_count = 4
         self.help_visible = True
         
-        # State variables
+        # Image state
         self.img1_path = None
         self.img2_path = None
         self.img1 = None
         self.img2 = None
-        # UMat versions for faster processing
         self.u_img1 = None 
         self.u_img2 = None
         
         self.h1 = 0; self.w1 = 0; self.h2 = 0; self.w2 = 0
-        self.src_pts = None
-        self.dst_pts = None
-        self.M = None
+        
+        # Affine parameters for the moving image (img1)
+        self.tx = 0.0
+        self.ty = 0.0
+        self.angle = 0.0  # degrees
+        self.M = None  # 2x3 affine matrix
+        
+        # Viewport
         self.zoom = 1.0
         self.offset_x = 0.0; self.offset_y = 0.0
         self.is_valid_auto_match = False
-        self.save_status = None  # None | "saving" | "saved"
+        self.save_status = None
         self.save_status_time = 0.0
         self.needs_render = True
         
@@ -95,38 +120,27 @@ class ManualAlignmentUI:
         print(f"Img1 (Moving): {os.path.basename(self.img1_path)}")
         print(f"Img2 (Canvas): {os.path.basename(self.img2_path)}")
         
-        # Read standard numpy arrays
-        self.img1 = cv.imread(self.img1_path)
-        self.img2 = cv.imread(self.img2_path)
+        # Read images
+        raw1 = cv.imread(self.img1_path)
+        raw2 = cv.imread(self.img2_path)
         
-        if self.img1 is None or self.img2 is None:
+        if raw1 is None or raw2 is None:
             print("Error loading images for this pair.")
             return
 
-        # Visually undistort the images for the user if camera params exist
-        if os.path.exists('camera_params.json'):
-            try:
-                with open('camera_params.json', 'r') as f:
-                    params = json.load(f)
-                K = np.array(params['camera_matrix'])
-                dist = np.array(params['dist_coeffs'])
-                
-                # Get optimal new camera matrix so we don't crop out valid pixels
-                h_img, w_img = self.img1.shape[:2]
-                new_cameramtx, roi = cv.getOptimalNewCameraMatrix(K, dist, (w_img, h_img), 1, (w_img, h_img))
-                
-                print("Applying visual lens undistortion to UI images...")
-                self.img1 = cv.undistort(self.img1, K, dist, None, new_cameramtx)
-                self.img2 = cv.undistort(self.img2, K, dist, None, new_cameramtx)
-            except Exception as e:
-                print(f"Warning: Failed to apply visual visual undistortion: {e}")
+        # Undistort and crop to ROI (removes black borders from lens correction)
+        print("Undistorting and cropping images...")
+        self.img1 = au.undistort_and_crop(raw1)
+        self.img2 = au.undistort_and_crop(raw2)
+        print(f"  img1: {raw1.shape[:2]} -> {self.img1.shape[:2]}")
+        print(f"  img2: {raw2.shape[:2]} -> {self.img2.shape[:2]}")
             
         # Create low-res proxies (50% scale) for fast interactive rendering
         self.proxy_scale = 0.5
         self.img1_proxy = cv.resize(self.img1, (0, 0), fx=self.proxy_scale, fy=self.proxy_scale, interpolation=cv.INTER_LINEAR)
         self.img2_proxy = cv.resize(self.img2, (0, 0), fx=self.proxy_scale, fy=self.proxy_scale, interpolation=cv.INTER_LINEAR)
             
-        # Upload to GPU memory immediately for rendering operations
+        # Upload to GPU memory for rendering
         self.u_img1 = cv.UMat(self.img1)
         self.u_img2 = cv.UMat(self.img2)
         self.u_img1_proxy = cv.UMat(self.img1_proxy)
@@ -135,7 +149,7 @@ class ManualAlignmentUI:
         self.h1, self.w1 = self.img1.shape[:2]
         self.h2, self.w2 = self.img2.shape[:2]
         
-        # Pre-allocate white masks as UMats ONCE per pair (Fixes the 60FPS memory leak)
+        # Pre-allocate white masks as UMats
         self.u_white1 = cv.UMat(np.ones((self.h1, self.w1), dtype=np.uint8)*255)
         self.u_white2 = cv.UMat(np.ones((self.h2, self.w2), dtype=np.uint8)*255)
         
@@ -144,28 +158,31 @@ class ManualAlignmentUI:
         self.u_white1_proxy = cv.UMat(np.ones((h1_p, w1_p), dtype=np.uint8)*255)
         self.u_white2_proxy = cv.UMat(np.ones((h2_p, w2_p), dtype=np.uint8)*255)
         
-        # Original corners of img1 [top-left, bottom-left, bottom-right, top-right]
-        self.src_pts = np.float32([[0, 0], [0, self.h1 - 1], [self.w1 - 1, self.h1 - 1], [self.w1 - 1, 0]])
-        
         if self.current_idx in self.saved_matrices:
-            print("Restoring previously adjusted homography from memory...")
+            print("Restoring previously adjusted affine transform from memory...")
             self.M = self.saved_matrices[self.current_idx].copy()
-            self.is_valid_auto_match = self.homography_status.get(self.current_idx, False)
-            self.dst_pts = cv.perspectiveTransform(self.src_pts.reshape(-1, 1, 2), self.M).reshape(4, 2)
+            self.tx, self.ty, self.angle = self.saved_params[self.current_idx]
+            self.is_valid_auto_match = self.match_status.get(self.current_idx, False)
         else:
-            print("Computing initial homography using alignment_utils.py...")
-            self.M, self.is_valid_auto_match = self.get_initial_homography()
-            self.dst_pts = cv.perspectiveTransform(self.src_pts.reshape(-1, 1, 2), self.M).reshape(4, 2)
+            print("Computing initial affine transform using feature matching...")
+            self.M, self.is_valid_auto_match = self.get_initial_affine()
+            # Decompose the auto-computed matrix to get tx, ty, angle
+            tx, ty, angle_deg, sx, sy = au.decompose_affine(self.M)
+            self.tx = tx
+            self.ty = ty
+            self.angle = angle_deg
             self.saved_matrices[self.current_idx] = self.M.copy()
-            self.homography_status[self.current_idx] = self.is_valid_auto_match
+            self.saved_params[self.current_idx] = (self.tx, self.ty, self.angle)
+            self.match_status[self.current_idx] = self.is_valid_auto_match
             
-        # Reset View to fit img2 nicely inside canvas
+        # Reset viewport to fit img2 nicely inside canvas
         self.zoom = min(self.canvas_w / self.w2, self.canvas_h / self.h2) * 0.8
         self.offset_x = (self.canvas_w - self.w2 * self.zoom) / 2
         self.offset_y = (self.canvas_h - self.h2 * self.zoom) / 2
         self.render()
         
-    def get_initial_homography(self):
+    def get_initial_affine(self):
+        """Compute the initial affine transform via feature matching."""
         img1_gray = cv.cvtColor(self.img1, cv.COLOR_BGR2GRAY)
         img2_gray = cv.cvtColor(self.img2, cv.COLOR_BGR2GRAY)
         
@@ -173,23 +190,26 @@ class ManualAlignmentUI:
             img1_gray, img2_gray, method='SIFT_BF', lowe_ratio=0.7
         )
         
-        M, mask = au.compute_homography(kp1, kp2, good_matches, min_match_count=10, img_shape=img1_gray.shape)
+        M, mask = au.compute_affine(kp1, kp2, good_matches, min_match_count=10, img_shape=img1_gray.shape)
         if M is not None:
-            print("Initial homography computed successfully.")
+            print("Initial affine transform computed successfully.")
             return M, True
         else:
-            print("Not enough good matches or homography failed constraints. Using pure translation as fallback.")
-            dy = int(self.h2 * 0.85) # Place top of img1 over bottom 15% of img2
+            print("Feature matching failed. Using translation-only fallback.")
+            dy = int(self.h2 * 0.85)  # Place top of img1 over bottom 15% of img2
             M = np.array([
                 [1.0, 0.0, 0.0],
-                [0.0, 1.0, dy],
-                [0.0, 0.0, 1.0]
-            ], dtype=np.float32)
+                [0.0, 1.0, dy]
+            ], dtype=np.float64)
             return M, False
-            
-    def update_M(self):
-        self.M = cv.getPerspectiveTransform(self.src_pts, self.dst_pts)
+
+    def rebuild_M(self):
+        """Rebuild the affine matrix from the current tx, ty, angle parameters."""
+        cx = self.w1 / 2.0
+        cy = self.h1 / 2.0
+        self.M = build_affine(self.tx, self.ty, self.angle, cx, cy)
         self.saved_matrices[self.current_idx] = self.M.copy()
+        self.saved_params[self.current_idx] = (self.tx, self.ty, self.angle)
         
     def screen_to_world(self, x, y):
         wx = (x - self.offset_x) / self.zoom
@@ -200,23 +220,54 @@ class ManualAlignmentUI:
         wx, wy = self.screen_to_world(x, y)
         
         if event == cv.EVENT_LBUTTONDOWN:
-            distances = np.linalg.norm(self.dst_pts - np.array([wx, wy]), axis=1)
-            closest_idx = np.argmin(distances)
-            
-            # Hitbox in world space scales with zoom
-            if distances[closest_idx] < 20 / self.zoom:
-                self.dragging_idx = closest_idx
+            # Shift+Left = rotate, plain Left = translate image or pan viewport
+            if flags & cv.EVENT_FLAG_SHIFTKEY:
+                self.rotating = True
+                self.rotate_start_x = x
+                self.rotate_start_angle = self.angle
             else:
-                self.panning = True
-                self.pan_start_x = x
-                self.pan_start_y = y
-                self.pan_start_offset_x = self.offset_x
-                self.pan_start_offset_y = self.offset_y
+                # Check if click lands on the warped img1 area → drag image
+                # Transform img1 corners to see bounding region
+                corners = np.float32([[0, 0], [self.w1, 0], [self.w1, self.h1], [0, self.h1]])
+                warped_corners = au.affine_transform_points(self.M, corners)
+                
+                # Simple point-in-polygon test
+                contour = warped_corners.reshape(-1, 1, 2).astype(np.float32)
+                inside = cv.pointPolygonTest(contour, (wx, wy), False)
+                
+                if inside >= 0:
+                    self.dragging = True
+                    self.drag_start_x = x
+                    self.drag_start_y = y
+                    self.drag_start_tx = self.tx
+                    self.drag_start_ty = self.ty
+                else:
+                    self.panning = True
+                    self.pan_start_x = x
+                    self.pan_start_y = y
+                    self.pan_start_offset_x = self.offset_x
+                    self.pan_start_offset_y = self.offset_y
+        
+        elif event == cv.EVENT_RBUTTONDOWN:
+            # Right-click = rotate
+            self.rotating = True
+            self.rotate_start_x = x
+            self.rotate_start_angle = self.angle
                 
         elif event == cv.EVENT_MOUSEMOVE:
-            if self.dragging_idx != -1:
-                self.dst_pts[self.dragging_idx] = [wx, wy]
-                self.update_M()
+            if self.dragging:
+                # Translate: convert screen pixel delta to world-space delta
+                dx = (x - self.drag_start_x) / self.zoom
+                dy = (y - self.drag_start_y) / self.zoom
+                self.tx = self.drag_start_tx + dx
+                self.ty = self.drag_start_ty + dy
+                self.rebuild_M()
+                self.needs_render = True
+            elif self.rotating:
+                # Rotate: horizontal mouse movement maps to angle
+                dx = x - self.rotate_start_x
+                self.angle = self.rotate_start_angle + dx * 0.1  # 0.1 deg per pixel
+                self.rebuild_M()
                 self.needs_render = True
             elif self.panning:
                 dx = x - self.pan_start_x
@@ -226,8 +277,14 @@ class ManualAlignmentUI:
                 self.needs_render = True
                 
         elif event == cv.EVENT_LBUTTONUP:
-            self.dragging_idx = -1
-            self.panning = False
+            if self.dragging or self.rotating or self.panning:
+                self.dragging = False
+                self.rotating = False
+                self.panning = False
+                self.render()  # Full quality re-render on release
+
+        elif event == cv.EVENT_RBUTTONUP:
+            self.rotating = False
             self.render()
 
         elif event == cv.EVENT_MOUSEWHEEL:
@@ -245,48 +302,60 @@ class ManualAlignmentUI:
             
             self.render()
 
+    def _make_view_matrix(self):
+        """2x3 view matrix: World Space → Screen Space (no perspective row)."""
+        return np.array([
+            [self.zoom, 0, self.offset_x],
+            [0, self.zoom, self.offset_y]
+        ], dtype=np.float64)
+
     def render(self):
-        is_interacting = (self.dragging_idx != -1) or self.panning
+        is_interacting = self.dragging or self.rotating or self.panning
         
-        # View matrix (World Space to Screen Space)
+        # View matrix (world → screen) as 3x3 for composition, then slice to 2x3
         S = np.array([
             [self.zoom, 0, self.offset_x],
             [0, self.zoom, self.offset_y],
             [0, 0, 1]
-        ], dtype=np.float32)
+        ], dtype=np.float64)
         
-        S_M = S @ self.M
+        # Compose: img1 affine (2x3→3x3) then view transform
+        M_3x3 = np.vstack([self.M, [0, 0, 1]])
+        S_M_3x3 = S @ M_3x3
+        S_M = S_M_3x3[:2, :]  # back to 2x3
+        S_view = S[:2, :]     # view-only 2x3
         
         render_w = self.canvas_w
         render_h = self.canvas_h
         
         if is_interacting:
-            # Render on a drastically smaller canvas to save PCIe transfer times over .get()
+            # Render on a smaller canvas for fast interaction
             render_w = int(self.canvas_w * self.proxy_scale)
             render_h = int(self.canvas_h * self.proxy_scale)
             
-            # P matrix maps WorldSpace to ProxySpace
-            P = np.array([[self.proxy_scale, 0, 0], [0, self.proxy_scale, 0], [0, 0, 1]], dtype=np.float32)
-            P_inv = np.array([[1.0/self.proxy_scale, 0, 0], [0, 1.0/self.proxy_scale, 0], [0, 0, 1]], dtype=np.float32)
+            P = np.array([[self.proxy_scale, 0, 0], [0, self.proxy_scale, 0], [0, 0, 1]], dtype=np.float64)
+            P_inv = np.array([[1.0/self.proxy_scale, 0, 0], [0, 1.0/self.proxy_scale, 0], [0, 0, 1]], dtype=np.float64)
             
-            # Transform from ProxySpace -> WorldSpace -> ScreenSpace -> ProxyScreenSpace
-            M2_render = P @ S @ P_inv
-            M1_render = P @ S_M @ P_inv
+            # ProxySpace → WorldSpace → ScreenSpace → ProxyScreenSpace
+            M2_3x3 = P @ S @ P_inv
+            M1_3x3 = P @ S_M_3x3 @ P_inv
+            M2_render = M2_3x3[:2, :]
+            M1_render = M1_3x3[:2, :]
             
-            u_warped2 = cv.warpPerspective(self.u_img2_proxy, M2_render, (render_w, render_h))
-            u_warped1 = cv.warpPerspective(self.u_img1_proxy, M1_render, (render_w, render_h))
+            u_warped2 = cv.warpAffine(self.u_img2_proxy, M2_render, (render_w, render_h))
+            u_warped1 = cv.warpAffine(self.u_img1_proxy, M1_render, (render_w, render_h))
             
-            u_mask2 = cv.warpPerspective(self.u_white2_proxy, M2_render, (render_w, render_h))
-            u_mask1 = cv.warpPerspective(self.u_white1_proxy, M1_render, (render_w, render_h))
+            u_mask2 = cv.warpAffine(self.u_white2_proxy, M2_render, (render_w, render_h))
+            u_mask1 = cv.warpAffine(self.u_white1_proxy, M1_render, (render_w, render_h))
         else:
-            # Full quality render to massive 1280x720 canvas
-            u_warped2 = cv.warpPerspective(self.u_img2, S, (render_w, render_h))
-            u_warped1 = cv.warpPerspective(self.u_img1, S_M, (render_w, render_h))
+            # Full quality render
+            u_warped2 = cv.warpAffine(self.u_img2, S_view, (render_w, render_h))
+            u_warped1 = cv.warpAffine(self.u_img1, S_M, (render_w, render_h))
             
-            u_mask2 = cv.warpPerspective(self.u_white2, S, (render_w, render_h))
-            u_mask1 = cv.warpPerspective(self.u_white1, S_M, (render_w, render_h))
+            u_mask2 = cv.warpAffine(self.u_white2, S_view, (render_w, render_h))
+            u_mask1 = cv.warpAffine(self.u_white1, S_M, (render_w, render_h))
         
-        # .get() is the main bottleneck. The smaller the canvas, the faster the PCIe bus transfer.
+        # Transfer from GPU
         warped2 = u_warped2.get()
         warped1 = u_warped1.get()
         mask2 = u_mask2.get()
@@ -304,20 +373,16 @@ class ManualAlignmentUI:
         
         mode_text = ""
         if self.mode == 0:
-            # Alpha
-            # Doing alpha blend on GPU
             u_blend = cv.addWeighted(u_warped2, 0.5, u_warped1, 0.5, 0)
             blend = u_blend.get()
             canvas[overlap_mask] = blend[overlap_mask]
             mode_text = "MODE: Alpha Blend (50/50)"
         elif self.mode == 1:
-            # Difference on GPU
             u_diff = cv.absdiff(u_warped2, u_warped1)
             diff = u_diff.get()
             canvas[overlap_mask] = diff[overlap_mask]
             mode_text = "MODE: Difference (Darker = Better Alignment)"
         elif self.mode == 2:
-            # Anaglyph mixing on CPU arrays
             anaglyph = np.zeros_like(warped2)
             anaglyph[:, :, 0] = warped2[:, :, 0] 
             anaglyph[:, :, 1] = warped2[:, :, 1] 
@@ -325,7 +390,6 @@ class ManualAlignmentUI:
             canvas[overlap_mask] = anaglyph[overlap_mask]
             mode_text = "MODE: Anaglyph (Red=Img1, Cyan=Img2)"
         elif self.mode == 3:
-            # Edges on GPU
             u_gray1 = cv.cvtColor(u_warped1, cv.COLOR_BGR2GRAY)
             u_gray2 = cv.cvtColor(u_warped2, cv.COLOR_BGR2GRAY)
             
@@ -342,25 +406,32 @@ class ManualAlignmentUI:
             canvas[overlap_mask] = edge_disp[overlap_mask]
             mode_text = "MODE: Edges (Red Edge = Img1, Cyan Edge = Img2)"
             
-        # If we rendered dynamically to a small canvas during movement, upscale it back to window size
+        # Upscale proxy canvas back to window size if we were interacting
         if is_interacting:
             canvas = cv.resize(canvas, (self.canvas_w, self.canvas_h), interpolation=cv.INTER_NEAREST)
             
-        screen_pts = cv.perspectiveTransform(self.dst_pts.reshape(-1, 1, 2), S).reshape(4, 2)
-        pts = np.int32(screen_pts)
+        # Draw the outline of warped img1 on screen
+        corners = np.float32([[0, 0], [self.w1, 0], [self.w1, self.h1], [0, self.h1]])
+        warped_corners = au.affine_transform_points(self.M, corners)
+        # Transform to screen space
+        screen_corners = warped_corners * self.zoom + np.array([self.offset_x, self.offset_y])
+        pts = np.int32(screen_corners)
         cv.polylines(canvas, [pts], True, (0, 255, 255), 2, cv.LINE_AA)
         
-        for pt in pts:
-            cv.circle(canvas, tuple(pt), 10, (255, 0, 255), -1) 
-            cv.circle(canvas, tuple(pt), 2, (0, 0, 0), -1) 
+        # Draw rotation center indicator
+        cx_world = self.M[0, 2] + self.w1 / 2.0 * self.M[0, 0] + self.h1 / 2.0 * self.M[0, 1]
+        cy_world = self.M[1, 2] + self.w1 / 2.0 * self.M[1, 0] + self.h1 / 2.0 * self.M[1, 1]
+        cx_screen = int(cx_world * self.zoom + self.offset_x)
+        cy_screen = int(cy_world * self.zoom + self.offset_y)
+        cv.drawMarker(canvas, (cx_screen, cy_screen), (255, 0, 255), cv.MARKER_CROSS, 16, 2)
             
-        # Draw status circle (Green = Homography Found, Red = Fallback Defaults)
+        # Status display
         status_color = (0, 255, 0) if self.is_valid_auto_match else (0, 0, 255)
         status_text = "AUTO MATCH" if self.is_valid_auto_match else "FALLBACK (FAILED)"
             
         if self.help_visible:
             overlay = canvas.copy()
-            cv.rectangle(overlay, (10, 10), (950, 210), (0, 0, 0), -1)
+            cv.rectangle(overlay, (10, 10), (950, 230), (0, 0, 0), -1)
             canvas = cv.addWeighted(overlay, 0.6, canvas, 0.4, 0)
             
             pair_status = f"Pair {self.current_idx + 1}/{len(self.pairs)}"
@@ -369,15 +440,16 @@ class ManualAlignmentUI:
             cv.putText(canvas, f"Detection: {status_text}", (45, 80), cv.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2, cv.LINE_AA)
             cv.putText(canvas, f"Base (Canvas): {os.path.basename(self.img2_path)}", (20, 105), cv.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 255), 1, cv.LINE_AA)
             cv.putText(canvas, f"Overlapping :  {os.path.basename(self.img1_path)}", (20, 125), cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 200, 255), 1, cv.LINE_AA)
-            cv.putText(canvas, "-> LEFT CLICK + DRAG MAGENTA DOTS to adjust perspective.", (20, 150), cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv.LINE_AA)
-            cv.putText(canvas, "-> LEFT CLICK + DRAG KEYBOARD to Pan | SCROLL to Zoom.", (20, 170), cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv.LINE_AA)
-            cv.putText(canvas, "-> KEYS: [m] mode | [q]/[e] prev/next | [s] save | [h] help | [esc] exit.", (20, 195), cv.FONT_HERSHEY_SIMPLEX, 0.6, (200, 255, 200), 1, cv.LINE_AA)
+            cv.putText(canvas, f"tx={self.tx:.1f}  ty={self.ty:.1f}  angle={self.angle:.2f} deg", (20, 148), cv.FONT_HERSHEY_SIMPLEX, 0.6, (180, 220, 255), 1, cv.LINE_AA)
+            cv.putText(canvas, "-> LEFT CLICK + DRAG on image to translate.", (20, 172), cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv.LINE_AA)
+            cv.putText(canvas, "-> RIGHT CLICK + DRAG (or SHIFT + LEFT) to rotate.", (20, 192), cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv.LINE_AA)
+            cv.putText(canvas, "-> KEYS: [m] mode | [q]/[e] prev/next | [s] save | [h] help | [esc] exit.", (20, 215), cv.FONT_HERSHEY_SIMPLEX, 0.6, (200, 255, 200), 1, cv.LINE_AA)
         else:
             cv.putText(canvas, f"Pair {self.current_idx + 1}/{len(self.pairs)} | {mode_text}", (20, 40), cv.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2, cv.LINE_AA)
             cv.circle(canvas, (25, 65), 8, status_color, -1)
             cv.putText(canvas, status_text, (45, 70), cv.FONT_HERSHEY_SIMPLEX, 0.6, status_color, 2, cv.LINE_AA)
         
-        # Fading save status indicator at bottom-left
+        # Fading save status indicator
         if self.save_status is not None:
             elapsed = time.time() - self.save_status_time
             if self.save_status == "saving":
@@ -413,7 +485,6 @@ class ManualAlignmentUI:
                 self.render()
                 self.needs_render = False
             elif self.save_status is not None:
-                # Keep rendering while save text is fading
                 self.render()
                 
             key = cv.waitKeyEx(15)
@@ -440,13 +511,13 @@ class ManualAlignmentUI:
                     self.current_idx -= 1
                     self.load_pair()
             elif char_key == ord('s'):
-                output_file = "homographies.json"
+                output_file = "affine_transforms.json"
                 self.save_status = "saving"
                 self.save_status_time = time.time()
-                self.render()  # Show "Saving..." immediately
-                cv.waitKey(1)  # Flush the frame
+                self.render()
+                cv.waitKey(1)
 
-                print(f"Saving Homography Matrix (M) to {output_file}:")
+                print(f"Saving Affine Transform (M) to {output_file}:")
                 data = {}
                 if os.path.exists(output_file):
                     with open(output_file, 'r') as f:
@@ -458,7 +529,9 @@ class ManualAlignmentUI:
                 pair_key = f"{os.path.basename(self.img1_path)}|{os.path.basename(self.img2_path)}"
                 data[pair_key] = {
                     "M": self.M.tolist(),
-                    "projected_corners": self.dst_pts.tolist(),
+                    "tx": self.tx,
+                    "ty": self.ty,
+                    "angle": self.angle,
                     "img1_path": self.img1_path,
                     "img2_path": self.img2_path,
                     "auto_match": self.is_valid_auto_match
@@ -468,13 +541,13 @@ class ManualAlignmentUI:
 
                 self.save_status = "saved"
                 self.save_status_time = time.time()
-                print(f"Saved successfully! Matrix for {pair_key} added to {output_file}.")
+                print(f"Saved successfully! Affine transform for {pair_key} added to {output_file}.")
                 
         cv.destroyAllWindows()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Manual Alignment UI for overlapping images.")
-    parser.add_argument("--dir", default="images/rgb_27_06_2025", help="Directory containing images to pair automatically")
+    parser.add_argument("--dir", default="test_images", help="Directory containing images to pair automatically")
     parser.add_argument("--img1", help="Path to the first image (the one that moves)")
     parser.add_argument("--img2", help="Path to the second image (static background canvas)")
     parser.add_argument("--start-pair", type=int, default=1, help="The pair index to start the GUI at (e.g. 27)")

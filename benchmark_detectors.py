@@ -2,7 +2,8 @@
 benchmark_detectors.py
 
 Runs all supported detector/matcher combinations over every image pair in a directory,
-measures performance, and writes per-method JSON results + a markdown summary table.
+measures performance (using affine transforms), and writes per-method JSON results +
+a markdown summary table.
 
 Usage:
     python benchmark_detectors.py --dir images/rgb_27_06_2025 [--max-pairs N]
@@ -53,14 +54,21 @@ def find_image_pairs(directory):
 
 def run_pair(img1_path, img2_path, method, orientation='vertical'):
     """
-    Run detect → match → homography for one pair + one method.
+    Run detect → match → affine estimation for one pair + one method.
+    Images are undistorted and cropped before feature detection.
     Returns a dict of metrics.
     """
-    img1 = cv.imread(img1_path, cv.IMREAD_GRAYSCALE)
-    img2 = cv.imread(img2_path, cv.IMREAD_GRAYSCALE)
+    img1_raw = cv.imread(img1_path)
+    img2_raw = cv.imread(img2_path)
 
-    if img1 is None or img2 is None:
+    if img1_raw is None or img2_raw is None:
         return {"error": "could not load images"}
+
+    # Undistort + crop to ROI (removes lens-distortion black borders)
+    img1_color = au.undistort_and_crop(img1_raw)
+    img2_color = au.undistort_and_crop(img2_raw)
+    img1 = cv.cvtColor(img1_color, cv.COLOR_BGR2GRAY)
+    img2 = cv.cvtColor(img2_color, cv.COLOR_BGR2GRAY)
 
     h1, w1 = img1.shape[:2]
 
@@ -75,18 +83,28 @@ def run_pair(img1_path, img2_path, method, orientation='vertical'):
     n_kp2 = len(kp2) if kp2 else 0
     n_good = len(good_matches)
 
-    # ── Homography ─────────────────────────────────────────────────────────────
+    # ── Affine estimation (RANSAC) ─────────────────────────────────────────────
     t1 = time.perf_counter()
-    M, mask = au.compute_homography(
+    M, mask = au.compute_affine(
         kp1, kp2, good_matches,
         min_match_count=10,
         img_shape=(h1, w1)
     )
-    t_homo = time.perf_counter() - t1
+    t_affine = time.perf_counter() - t1
 
     success = M is not None
     inliers = int(mask.sum()) if (mask is not None) else 0
     inlier_ratio = (inliers / n_good) if n_good > 0 else 0.0
+
+    # Decompose affine for diagnostics
+    affine_info = {}
+    if success:
+        tx, ty, angle_deg, sx, sy = au.decompose_affine(M)
+        affine_info = {
+            "tx": round(tx, 2), "ty": round(ty, 2),
+            "angle_deg": round(angle_deg, 3),
+            "scale_x": round(sx, 4), "scale_y": round(sy, 4),
+        }
 
     return {
         "img1": os.path.basename(img1_path),
@@ -97,10 +115,11 @@ def run_pair(img1_path, img2_path, method, orientation='vertical'):
         "inlier_count":    inliers,
         "inlier_ratio":    round(inlier_ratio, 4),
         "time_detect_match_ms": round(t_detect_match * 1000, 1),
-        "time_homography_ms":   round(t_homo * 1000, 1),
-        "total_time_ms":        round((t_detect_match + t_homo) * 1000, 1),
+        "time_affine_ms":       round(t_affine * 1000, 1),
+        "total_time_ms":        round((t_detect_match + t_affine) * 1000, 1),
         "success":         success,
         "M":               M.tolist() if success else None,
+        **affine_info,
     }
 
 
@@ -183,7 +202,8 @@ def write_summary_table(summaries, output_path):
         "> **Avg Matches (all)**: averaged over ALL pairs, including failures.  ",
         "> **Avg Matches (ok)**: averaged over SUCCESSFUL pairs only.  ",
         r"> **Avg Inlier Ratio**: inliers / good\_matches for successful pairs.  ",
-        "> **Avg Time**: total detect+match+RANSAC time per pair in ms.  ",
+        "> **Avg Time**: total detect+match+affine RANSAC time per pair in ms.  ",
+        "> **Transform**: Affine (2\u00d73) via `cv.estimateAffine2D` with RANSAC.  ",
     ]
     Path(output_path).write_text("\n".join(lines), encoding="utf-8")
     print(f"  Summary table written → {output_path}")
